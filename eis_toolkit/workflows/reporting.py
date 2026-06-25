@@ -12,18 +12,66 @@ from beartype import beartype
 from beartype.typing import Union
 
 
+# Substring (case-insensitive) in a fault's type/feature attribute that marks
+# it as a thrust / layered (low-angle) fault, drawn with a dashed line.
+THRUST_KEYWORDS = ("thrust",)
+# Attribute columns searched for the fault type description.
+FAULT_TYPE_COLUMNS = ("TYPE", "FEATURE", "FAULT_TYPE", "type")
+
+
+def _is_thrust(values) -> np.ndarray:
+    """Boolean mask of features whose type text contains a thrust keyword."""
+    text = values.astype(str).str.lower()
+    mask = np.zeros(len(values), dtype=bool)
+    for keyword in THRUST_KEYWORDS:
+        mask |= text.str.contains(keyword, na=False)
+    return mask
+
+
+def _split_faults(faults: gpd.GeoDataFrame):
+    """Split faults into (thrust, other) GeoDataFrames using the type attribute."""
+    type_column = next((c for c in FAULT_TYPE_COLUMNS if c in faults.columns), None)
+    if type_column is None:
+        return faults.iloc[0:0], faults
+    thrust_mask = _is_thrust(faults[type_column])
+    return faults[thrust_mask], faults[~thrust_mask]
+
+
+def _fault_lines(faults: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Return drawable line geometries for faults, dropping empty/null ones.
+
+    Polygon fault geometries are converted to their boundaries so they read as
+    lines; line geometries are kept as-is. This avoids calling ``.boundary`` on
+    geometries (e.g. lines or empties) where it would raise.
+    """
+    cleaned = faults[~(faults.geometry.is_empty | faults.geometry.isna())]
+    if cleaned.empty:
+        return cleaned
+    is_polygon = cleaned.geometry.type.isin(["Polygon", "MultiPolygon"])
+    lines = cleaned.geometry.copy()
+    lines.loc[is_polygon] = cleaned.geometry[is_polygon].boundary
+    result = cleaned.set_geometry(lines)
+    return result[~(result.geometry.is_empty | result.geometry.isna())]
+
+
 @beartype
 def write_map_pdf(
     prospectivity: np.ndarray,
     profile: dict,
     deposits: gpd.GeoDataFrame,
     output_path: Union[str, os.PathLike],
+    faults: gpd.GeoDataFrame = None,
 ) -> None:
-    """Render the prospectivity map with deposit locations to a PDF."""
+    """Render the prospectivity map with deposits and faults to a PDF.
+
+    Deposits are drawn as yellow points. Faults are drawn in red: regular faults
+    as solid lines and thrust (layered/low-angle) faults as dashed lines.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
     from rasterio.transform import array_bounds
 
     masked = np.ma.masked_equal(prospectivity, profile.get("nodata", -9999.0))
@@ -34,11 +82,32 @@ def write_map_pdf(
     image = ax.imshow(masked, cmap="viridis", extent=(left, right, bottom, top))
     fig.colorbar(image, ax=ax, shrink=0.6, label="Prospectivity (probability)")
 
+    legend_handles = []
+
+    # Faults in red: thrust faults dashed, other faults solid.
+    if faults is not None and not faults.empty:
+        thrust_faults, other_faults = _split_faults(faults)
+        other_lines = _fault_lines(other_faults)
+        thrust_lines = _fault_lines(thrust_faults)
+        if not other_lines.empty:
+            other_lines.plot(ax=ax, color="red", linewidth=0.8, linestyle="solid")
+            legend_handles.append(Line2D([0], [0], color="red", lw=1.2, linestyle="solid", label="Fault"))
+        if not thrust_lines.empty:
+            thrust_lines.plot(ax=ax, color="red", linewidth=1.0, linestyle="dashed")
+            legend_handles.append(Line2D([0], [0], color="red", lw=1.2, linestyle="dashed", label="Thrust fault"))
+
+    # Deposits as yellow points.
     if not deposits.empty:
         deposit_points = deposits[deposits.geometry.type.isin(["Point", "MultiPoint"])]
         if not deposit_points.empty:
-            deposit_points.plot(ax=ax, color="red", markersize=12, label="Deposits")
-            ax.legend(loc="upper right")
+            deposit_points.plot(ax=ax, color="yellow", markersize=12, edgecolor="black", linewidth=0.3)
+            legend_handles.append(
+                Line2D([0], [0], marker="o", color="none", markerfacecolor="yellow",
+                       markeredgecolor="black", markersize=8, label="Deposits")
+            )
+
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper right")
 
     ax.set_title("Mineral Prospectivity Map")
     ax.set_xlabel("Easting")
@@ -70,6 +139,17 @@ def write_statistics_xlsx(stats: dict, output_path: Union[str, os.PathLike]) -> 
     importance_sheet.append(["Feature", "Importance"])
     for key, value in stats["feature_importance"].items():
         importance_sheet.append([key, round(value, 4)])
+
+    relation = stats.get("fault_relation")
+    if relation:
+        fault_sheet = workbook.create_sheet("Fault-deposit relation")
+        fault_sheet.append(["Metric", "Value"])
+        fault_sheet.append([f"Buffer distance (km)", relation["buffer_km"]])
+        fault_sheet.append(["Total deposits", relation["total_deposits"]])
+        fault_sheet.append(["Deposits within buffer (fault-related)", relation["within_count"]])
+        fault_sheet.append(["Fault-related deposits (%)", relation["within_percent"]])
+        fault_sheet.append(["Deposits outside buffer", relation["outside_count"]])
+        fault_sheet.append(["Non-fault-related deposits (%)", relation["outside_percent"]])
 
     if stats.get("comparison"):
         comparison_sheet = workbook.create_sheet("Model comparison")
@@ -127,6 +207,24 @@ def write_report_docx(
         _add_dict_table(
             document, {k: round(v, 4) for k, v in stats["feature_importance"].items()}
         )
+
+    relation = stats.get("fault_relation")
+    if relation:
+        document.add_heading("Fault-deposit relationship", level=1)
+        document.add_paragraph(
+            f"Using a {relation['buffer_km']} km buffer around faults, "
+            f"{relation['within_count']} of {relation['total_deposits']} deposits "
+            f"({relation['within_percent']}%) are fault-related (within the buffer), and "
+            f"{relation['outside_count']} ({relation['outside_percent']}%) lie outside it."
+        )
+        _add_dict_table(document, {
+            "Buffer distance (km)": relation["buffer_km"],
+            "Total deposits": relation["total_deposits"],
+            "Fault-related (within buffer)": relation["within_count"],
+            "Fault-related (%)": relation["within_percent"],
+            "Outside buffer": relation["outside_count"],
+            "Outside buffer (%)": relation["outside_percent"],
+        })
 
     if stats.get("comparison"):
         document.add_heading("Model comparison", level=1)

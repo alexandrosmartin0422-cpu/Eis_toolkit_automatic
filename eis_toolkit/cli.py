@@ -4126,6 +4126,9 @@ class MpmModel(str, Enum):
     random_forest = "random_forest"
     gradient_boosting = "gradient_boosting"
     logistic_regression = "logistic_regression"
+    xgboost = "xgboost"
+    lightgbm = "lightgbm"
+    catboost = "catboost"
 
 
 @app.command()
@@ -4136,10 +4139,11 @@ def run_mpm_workflow_cli(
     deposits: INPUT_FILE_OPTION,
     output_dir: OUTPUT_DIR_OPTION,
     extra_raster: Annotated[Optional[List[Path]], typer.Option()] = None,
-    model: Annotated[MpmModel, typer.Option(case_sensitive=False)] = MpmModel.random_forest,
+    model: Annotated[MpmModel, typer.Option(case_sensitive=False)] = MpmModel.lightgbm,
     compare: bool = False,
     commodity_filter: Optional[str] = None,
     fallback_crs: Optional[str] = None,
+    fault_buffer_km: float = 1.0,
     n_estimators: int = 100,
     random_state: int = 42,
 ):
@@ -4165,6 +4169,7 @@ def run_mpm_workflow_cli(
             compare=compare,
             commodity_filter=commodity_filter,
             fallback_crs=fallback_crs,
+            fault_buffer_km=fault_buffer_km,
             n_estimators=n_estimators,
             random_state=random_state,
         )
@@ -4172,6 +4177,42 @@ def run_mpm_workflow_cli(
     with ProgressLog.saving_output_files(output_dir):
         for name, path in outputs.items():
             typer.echo(f"  {name}: {path}")
+
+    ProgressLog.finish()
+
+
+@app.command()
+def build_web_map_cli(
+    prospectivity_raster: INPUT_FILE_OPTION,
+    output_dir: OUTPUT_DIR_OPTION,
+    deposits: Annotated[Optional[Path], typer.Option()] = None,
+    fault: Annotated[Optional[Path], typer.Option()] = None,
+    commodity_filter: Optional[str] = None,
+    fallback_crs: Optional[str] = None,
+    title: str = "Mineral Prospectivity Map",
+):
+    """Build an interactive web map (index.html) from a prospectivity raster.
+
+    The output directory will contain a self-contained index.html and a PNG
+    overlay that can be published on GitHub Pages or any static web host.
+    Deposits are shown as yellow markers and faults in red (thrust faults
+    dashed).
+    """
+    from eis_toolkit.workflows.web_map import build_web_map
+
+    with ProgressLog.running_algorithm():
+        index_path = build_web_map(
+            prospectivity_raster=prospectivity_raster,
+            output_dir=output_dir,
+            deposit_file=str(deposits) if deposits else None,
+            fault_file=str(fault) if fault else None,
+            commodity_filter=commodity_filter,
+            fallback_crs=fallback_crs,
+            title=title,
+        )
+
+    with ProgressLog.saving_output_files(output_dir):
+        typer.echo(f"  web map: {index_path}")
 
     ProgressLog.finish()
 

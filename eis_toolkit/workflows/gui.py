@@ -21,7 +21,14 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-MODELS = ["random_forest", "gradient_boosting", "logistic_regression"]
+MODELS = [
+    "random_forest",
+    "gradient_boosting",
+    "logistic_regression",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+]
 
 
 class MpmApp:
@@ -40,9 +47,10 @@ class MpmApp:
             "output_dir": tk.StringVar(),
             "commodity_filter": tk.StringVar(value="Au"),
             "fallback_crs": tk.StringVar(),
+            "fault_buffer_km": tk.StringVar(value="1.0"),
             "n_estimators": tk.StringVar(value="100"),
         }
-        self.model_var = tk.StringVar(value=MODELS[0])
+        self.model_var = tk.StringVar(value="lightgbm")
         self.compare_var = tk.BooleanVar(value=False)
         self.extra_rasters: list = []
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -88,6 +96,8 @@ class MpmApp:
         ttk.Entry(opts, textvariable=self.vars["fallback_crs"], width=14).grid(row=1, column=1, sticky="w", **pad)
         ttk.Label(opts, text="n_estimators").grid(row=1, column=2, sticky="w", **pad)
         ttk.Entry(opts, textvariable=self.vars["n_estimators"], width=10).grid(row=1, column=3, **pad)
+        ttk.Label(opts, text="Fault buffer (km)").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(opts, textvariable=self.vars["fault_buffer_km"], width=10).grid(row=2, column=1, sticky="w", **pad)
 
         # Run button + progress
         run_frame = ttk.Frame(self.root)
@@ -173,6 +183,11 @@ class MpmApp:
         except ValueError:
             messagebox.showerror("Invalid value", "n_estimators must be an integer.")
             return
+        try:
+            fault_buffer_km = float(self.vars["fault_buffer_km"].get())
+        except ValueError:
+            messagebox.showerror("Invalid value", "Fault buffer (km) must be a number.")
+            return
 
         self.run_button.configure(state="disabled")
         self.progress.start(12)
@@ -189,6 +204,7 @@ class MpmApp:
             compare=self.compare_var.get(),
             commodity_filter=self.vars["commodity_filter"].get() or None,
             fallback_crs=self.vars["fallback_crs"].get() or None,
+            fault_buffer_km=fault_buffer_km,
             n_estimators=n_estimators,
         )
         threading.Thread(target=self._worker, args=(args,), daemon=True).start()
@@ -204,7 +220,8 @@ class MpmApp:
                 self._log_message(f"  {name}: {path}")
             self._result_queue.put(
                 {"raster": outputs.get("prospectivity_raster"), "deposits": args["deposit_file"],
-                 "commodity": args.get("commodity_filter"), "fallback_crs": args.get("fallback_crs")}
+                 "faults": args.get("fault_file"), "commodity": args.get("commodity_filter"),
+                 "fallback_crs": args.get("fallback_crs")}
             )
         except Exception as exc:  # noqa: BLE001 - surface any failure to the user
             self._log_message(f"ERROR: {exc}")
@@ -224,15 +241,20 @@ class MpmApp:
         if not raster_path or not os.path.exists(raster_path):
             return
         try:
+            import geopandas as gpd
             import numpy as np
             import rasterio
             from rasterio.transform import array_bounds
             from matplotlib.figure import Figure
+            from matplotlib.lines import Line2D
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+            from eis_toolkit.workflows.reporting import _fault_lines, _split_faults
 
             with rasterio.open(raster_path) as src:
                 data = src.read(1)
                 profile = src.profile
+            crs = profile["crs"]
             masked = np.ma.masked_equal(data, profile.get("nodata", -9999.0))
             height, width = data.shape
             left, bottom, right, top = array_bounds(height, width, profile["transform"])
@@ -244,6 +266,47 @@ class MpmApp:
             axis = figure.add_subplot(111)
             image = axis.imshow(masked, cmap="magma", extent=(left, right, bottom, top), vmin=0, vmax=1)
             figure.colorbar(image, ax=axis, shrink=0.7, label="Prospectivity")
+
+            handles = []
+
+            def _load(path):
+                gdf = gpd.read_file(path)
+                if gdf.crs is None and result.get("fallback_crs"):
+                    gdf = gdf.set_crs(result["fallback_crs"])
+                return gdf.to_crs(crs) if gdf.crs and gdf.crs != crs else gdf
+
+            # Faults in red: thrust dashed, others solid.
+            if result.get("faults"):
+                faults = _load(result["faults"])
+                thrust, other = _split_faults(faults)
+                other_lines = _fault_lines(other)
+                thrust_lines = _fault_lines(thrust)
+                if not other_lines.empty:
+                    other_lines.plot(ax=axis, color="red", linewidth=0.6, linestyle="solid")
+                    handles.append(Line2D([0], [0], color="red", lw=1.2, linestyle="solid", label="Fault"))
+                if not thrust_lines.empty:
+                    thrust_lines.plot(ax=axis, color="red", linewidth=0.8, linestyle="dashed")
+                    handles.append(Line2D([0], [0], color="red", lw=1.2, linestyle="dashed", label="Thrust fault"))
+
+            # Deposits in yellow.
+            if result.get("deposits"):
+                deposits = _load(result["deposits"])
+                commodity = result.get("commodity")
+                if commodity:
+                    cols = [c for c in deposits.columns if "COMMODITY" in c.upper()]
+                    if cols:
+                        mask = np.zeros(len(deposits), dtype=bool)
+                        for col in cols:
+                            mask |= deposits[col].astype(str).str.contains(commodity, case=False, na=False)
+                        deposits = deposits[mask]
+                points = deposits[deposits.geometry.type.isin(["Point", "MultiPoint"])]
+                if not points.empty:
+                    points.plot(ax=axis, color="yellow", markersize=8, edgecolor="black", linewidth=0.2)
+                    handles.append(Line2D([0], [0], marker="o", color="none", markerfacecolor="yellow",
+                                          markeredgecolor="black", markersize=7, label="Deposits"))
+
+            if handles:
+                axis.legend(handles=handles, loc="upper right", fontsize=7)
             axis.set_title("Prospectivity map")
             axis.set_xlabel("Easting")
             axis.set_ylabel("Northing")

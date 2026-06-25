@@ -41,6 +41,12 @@ esda = "^2.5.1"
 scipy = "1.11.4"
 numba = "^0.60.0"
 fiona = "<1.10.0"
+xgboost = "^3.0.0"
+lightgbm = "^4.0.0"
+catboost = "^1.2.0"
+folium = ">=0.16.0"
+openpyxl = "^3.1.0"
+python-docx = "^1.0.0"
 
 [tool.poetry.dev-dependencies]
 jupyterlab = "^3.4.5"

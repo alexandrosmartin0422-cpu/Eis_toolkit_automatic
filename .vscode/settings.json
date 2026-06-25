@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\HoHo\\miniconda3\\envs\\eis_toolkit_env\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\Users\\HoHo\\miniconda3\\envs\\eis_toolkit_env\\Lib\\site-packages"
+    ]
+}

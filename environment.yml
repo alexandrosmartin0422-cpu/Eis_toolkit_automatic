@@ -23,5 +23,13 @@ dependencies:
   - mapclassify >= 2.6.1
   - esda >= 2.5.1
   - numba >= 0.60.0
+  # Modern gradient boosting models for the prospectivity workflow
+  - xgboost >=3.0.0
+  - lightgbm >=4.0.0
+  - catboost >=1.2.0
+  # Reporting and web map outputs
+  - folium >=0.16.0
+  - openpyxl >=3.1.0
+  - python-docx >=1.0.0
   # Dependencies for testing
   - pytest >=7.2.1

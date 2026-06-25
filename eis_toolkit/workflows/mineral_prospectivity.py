@@ -39,24 +39,61 @@ Number = Union[int, float]
 # GDAL reads shapefiles that are missing their .shx index when this is enabled.
 os.environ.setdefault("SHAPE_RESTORE_SHX", "YES")
 
-ModelType = Literal["random_forest", "gradient_boosting", "logistic_regression"]
+ModelType = Literal[
+    "random_forest",
+    "gradient_boosting",
+    "logistic_regression",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+]
 
 
-def _read_vector(path: Union[str, os.PathLike], fallback_crs: Optional[str] = None) -> gpd.GeoDataFrame:
-    """Read a vector file, assigning a fallback CRS if the file has none."""
+def _read_vector(
+    path: Union[str, os.PathLike], fallback_crs: Optional[str] = None, role: str = "vector"
+) -> gpd.GeoDataFrame:
+    """Read and validate a vector file, assigning a fallback CRS if it has none.
+
+    Raises InvalidParameterValueException with an actionable message when the
+    file has no CRS (and no fallback was given) or contains no usable geometry.
+    """
     gdf = gpd.read_file(path)
-    if gdf.crs is None and fallback_crs is not None:
+
+    if gdf.crs is None:
+        if fallback_crs is None:
+            raise InvalidParameterValueException(
+                f"The {role} file '{os.path.basename(str(path))}' has no coordinate reference "
+                f"system (missing .prj). Set the 'Fallback CRS' option (e.g. EPSG:4283 or "
+                f"EPSG:7844 for Australian lon/lat data) so the data can be placed correctly."
+            )
         gdf = gdf.set_crs(fallback_crs)
-    return gdf
+
+    # Drop empty/null geometries that would break distance/rasterize operations.
+    valid = gdf[~(gdf.geometry.is_empty | gdf.geometry.isna())]
+    if valid.empty:
+        raise InvalidParameterValueException(
+            f"The {role} file '{os.path.basename(str(path))}' contains no usable geometry "
+            f"(all features are empty or null)."
+        )
+    return valid
 
 
 def _align_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
-    """Reproject a GeoDataFrame to the target CRS if needed."""
+    """Reproject a GeoDataFrame to the target CRS if needed.
+
+    After reprojection, geometries that became empty or invalid (e.g. points far
+    outside the projection's valid area) are dropped so downstream operations do
+    not fail with opaque "null geometry" errors.
+    """
     if gdf.crs is None:
         return gdf.set_crs(target_crs)
-    if gdf.crs != target_crs:
-        return gdf.to_crs(target_crs)
-    return gdf
+    if gdf.crs == target_crs:
+        return gdf
+    reprojected = gdf.to_crs(target_crs)
+    finite = reprojected[~(reprojected.geometry.is_empty | reprojected.geometry.isna())]
+    # Drop non-finite coordinates produced by projecting out-of-range points.
+    finite = finite[finite.geometry.apply(lambda g: g is not None and np.all(np.isfinite(g.bounds)))]
+    return finite
 
 
 def _profile_to_plain_dict(profile: Union[profiles.Profile, dict]) -> dict:
@@ -187,6 +224,114 @@ def _sample_background(
     return train_mask
 
 
+def analyze_fault_deposit_relation(
+    faults: gpd.GeoDataFrame, deposits: gpd.GeoDataFrame, buffer_km: float
+) -> dict:
+    """Quantify how many deposits lie within a buffer distance of any fault.
+
+    Both layers must share a projected (metre) CRS. A buffer of ``buffer_km``
+    kilometres is built around the faults and deposits are counted by whether
+    they fall inside it.
+
+    Returns:
+        Dict with total deposits, count and percentage within the buffer, the
+        count/percentage outside, and the buffer distance used.
+    """
+    point_deposits = deposits[deposits.geometry.type.isin(["Point", "MultiPoint"])]
+    total = len(point_deposits)
+    if total == 0:
+        return {"buffer_km": buffer_km, "total_deposits": 0, "within_count": 0,
+                "within_percent": 0.0, "outside_count": 0, "outside_percent": 0.0}
+
+    buffer_m = buffer_km * 1000.0
+    # Build an STRtree over the faults and query each deposit's nearest fault
+    # distance. This scales to hundreds of thousands of fault segments without
+    # the cost of a buffer-union over every feature. Handle both shapely 1.x
+    # (nearest returns a geometry) and 2.x (nearest returns an index).
+    try:
+        from shapely import STRtree  # shapely >= 2.0
+    except ImportError:
+        from shapely.strtree import STRtree  # shapely 1.8.x
+
+    fault_geoms = list(faults.geometry.values)
+    tree = STRtree(fault_geoms)
+    within_count = 0
+    for point in point_deposits.geometry.values:
+        nearest = tree.nearest(point)
+        nearest_geom = fault_geoms[nearest] if isinstance(nearest, (int, np.integer)) else nearest
+        if point.distance(nearest_geom) <= buffer_m:
+            within_count += 1
+    within_percent = round(100.0 * within_count / total, 2)
+    return {
+        "buffer_km": buffer_km,
+        "total_deposits": total,
+        "within_count": within_count,
+        "within_percent": within_percent,
+        "outside_count": total - within_count,
+        "outside_percent": round(100.0 - within_percent, 2),
+    }
+
+
+def _build_booster(model: ModelType, n_estimators: int, random_state: Optional[int]):
+    """Instantiate a modern gradient-boosting classifier (sklearn-compatible)."""
+    if model == "xgboost":
+        from xgboost import XGBClassifier
+
+        return XGBClassifier(
+            n_estimators=n_estimators, random_state=random_state,
+            eval_metric="logloss", n_jobs=-1, tree_method="hist",
+        )
+    if model == "lightgbm":
+        from lightgbm import LGBMClassifier
+
+        return LGBMClassifier(
+            n_estimators=n_estimators, random_state=random_state, n_jobs=-1, verbose=-1,
+        )
+    if model == "catboost":
+        from catboost import CatBoostClassifier
+
+        return CatBoostClassifier(
+            iterations=n_estimators, random_state=random_state, verbose=False,
+        )
+    raise InvalidParameterValueException(f"Unknown booster: {model}")
+
+
+def _train_sklearn_compatible(model: ModelType, X, y, n_estimators, random_state):
+    """Train a modern booster with a train/test split and return (model, metrics).
+
+    Mirrors the eis_toolkit trainers' "split" validation so results are
+    comparable with the built-in models.
+    """
+    from sklearn.model_selection import train_test_split
+
+    from eis_toolkit.evaluation.scoring import score_predictions
+
+    estimator = _build_booster(model, n_estimators, random_state)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=random_state, stratify=y
+    )
+    estimator.fit(X_train, y_train)
+    y_pred = estimator.predict(X_test)
+    metrics = score_predictions(y_test, y_pred, ["accuracy", "precision", "recall", "f1"])
+    return estimator, metrics
+
+
+def _predict_proba_grid(trained_model, X: np.ndarray) -> np.ndarray:
+    """Return positive-class probabilities for all cells, for any model type.
+
+    Uses eis_toolkit's predict_classifier for sklearn BaseEstimator models and
+    falls back to predict_proba directly for models that are not BaseEstimator
+    subclasses (e.g. CatBoost).
+    """
+    from sklearn.base import BaseEstimator
+
+    if isinstance(trained_model, BaseEstimator):
+        _, probabilities = predict_classifier(data=X, model=trained_model, include_probabilities=True)
+        return probabilities
+    proba = trained_model.predict_proba(X)
+    return proba[:, 1] if proba.ndim == 2 and proba.shape[1] == 2 else proba.max(axis=1)
+
+
 def _train_model(
     model: ModelType,
     X: np.ndarray,
@@ -211,6 +356,8 @@ def _train_model(
             X=X, y=y, validation_method="split", metrics=metrics,
             random_state=random_state,
         )
+    if model in ("xgboost", "lightgbm", "catboost"):
+        return _train_sklearn_compatible(model, X, y, n_estimators, random_state)
     raise InvalidParameterValueException(f"Unknown model type: {model}")
 
 
@@ -235,10 +382,11 @@ def run_mineral_prospectivity_workflow(
     deposit_file: Union[str, os.PathLike],
     output_dir: Union[str, os.PathLike],
     extra_rasters: Optional[Sequence[Union[str, os.PathLike]]] = None,
-    model: ModelType = "random_forest",
+    model: ModelType = "lightgbm",
     compare: bool = False,
     commodity_filter: Optional[str] = None,
     fallback_crs: Optional[str] = None,
+    fault_buffer_km: float = 1.0,
     n_estimators: int = 100,
     random_state: Optional[int] = 42,
 ) -> Dict[str, str]:
@@ -253,16 +401,21 @@ def run_mineral_prospectivity_workflow(
         output_dir: Directory where the outputs are written. Created if missing.
         extra_rasters: Optional additional evidence rasters (e.g. slope, aspect,
             geophysics). Resampled onto the DEM grid.
-        model: Classifier to use: "random_forest", "gradient_boosting" or
-            "logistic_regression". Defaults to "random_forest". When ``compare``
-            is True this is the primary model used for the main map and report.
-        compare: If True, train all three classifiers on the same data, write a
+        model: Classifier to use: "random_forest", "gradient_boosting",
+            "logistic_regression", "xgboost", "lightgbm" or "catboost". Defaults
+            to "lightgbm". When ``compare`` is True this is the primary model
+            used for the main map and report.
+        compare: If True, train all classifiers on the same data, write a
             prospectivity raster per model and add a model comparison table to
             the outputs. Defaults to False.
         commodity_filter: If given, keep only deposits whose commodity attribute
             contains this text (e.g. "Au" for gold). Defaults to None (all).
         fallback_crs: CRS string (e.g. "EPSG:4283") assigned to vector inputs
             that lack a defined CRS, such as shapefiles missing a .prj file.
+        fault_buffer_km: Buffer distance in kilometres around faults used to
+            quantify the share of deposits that are fault-related. The buffer is
+            used only for this analysis; the map shows the unbuffered faults.
+            Defaults to 1.0 km.
         n_estimators: Number of trees for tree-based models. Defaults to 100.
         random_state: Seed for reproducibility. Defaults to 42.
 
@@ -286,12 +439,34 @@ def run_mineral_prospectivity_workflow(
         # Rasterize deposits on the reference grid for use as labels.
         with rasterio.open(evidence_files[0]) as ref:
             ref_crs = ref.crs
-        deposits = _align_crs(_read_vector(deposit_file, fallback_crs), ref_crs)
+            ref_bounds = ref.bounds
+        # Faults for map display, aligned to the reference CRS.
+        fault_overlay = _align_crs(_read_vector(fault_file, fallback_crs, role="fault"), ref_crs)
+
+        deposits = _align_crs(_read_vector(deposit_file, fallback_crs, role="deposit"), ref_crs)
+        n_before_filter = len(deposits)
         deposits = _filter_deposits(deposits, commodity_filter)
         if deposits.empty:
             raise InvalidParameterValueException(
-                "No deposits remain after filtering; check the commodity filter."
+                f"No deposits remain after the commodity filter '{commodity_filter}'. "
+                f"The file had {n_before_filter} deposits. Check the filter text matches the "
+                f"commodity attribute, or clear the 'Commodity filter' option to use all deposits."
             )
+
+        # Warn-by-error if deposits do not overlap the DEM extent at all.
+        dminx, dminy, dmaxx, dmaxy = deposits.total_bounds
+        if dmaxx < ref_bounds.left or dminx > ref_bounds.right or dmaxy < ref_bounds.bottom or dminy > ref_bounds.top:
+            raise InvalidParameterValueException(
+                "The deposit data does not overlap the DEM extent. The DEM bounds are "
+                f"{tuple(round(b) for b in ref_bounds)} but the deposits span "
+                f"{tuple(round(b) for b in deposits.total_bounds)} (same CRS). Use deposit data "
+                "clipped to the study area (e.g. the processed Kalgoorlie deposits), or a DEM "
+                "covering the deposits."
+            )
+
+        # Quantify the fault-deposit spatial relationship (buffer in km).
+        fault_relation = analyze_fault_deposit_relation(fault_overlay, deposits, fault_buffer_km)
+
         deposit_label_path = Path(workdir) / "deposits_label.tif"
         deposit_array = rasterize_vector(
             geodataframe=deposits, raster_profile=ref_profile, default_value=1.0, fill_value=0.0
@@ -307,7 +482,10 @@ def run_mineral_prospectivity_workflow(
         n_positive = int(y.sum())
         if n_positive == 0:
             raise InvalidParameterValueException(
-                "No deposit points fall on the DEM grid; check CRS and extent of the deposit data."
+                "No deposit cells fall on valid (non-nodata) DEM grid cells, so the model has no "
+                "positive samples to learn from. Check that the deposit data and DEM share the same "
+                "area, that the Fallback CRS is correct, and that deposits are not all in DEM nodata "
+                "regions."
             )
 
         # Train on deposits + sampled background, then predict the whole grid.
@@ -323,9 +501,7 @@ def run_mineral_prospectivity_workflow(
             trained_model, train_metrics = _train_model(
                 current, X[train_mask], y[train_mask], n_estimators, random_state
             )
-            _, probabilities = predict_classifier(
-                data=X, model=trained_model, include_probabilities=True
-            )
+            probabilities = _predict_proba_grid(trained_model, X)
             prospectivity = _restore_to_grid(probabilities, nodata_mask, reference_profile)
 
             raster_name = "prospectivity.tif" if current == model else f"prospectivity_{current}.tif"
@@ -347,13 +523,14 @@ def run_mineral_prospectivity_workflow(
             int(train_mask.sum()), evidence_files, primary["trained_model"],
         )
         stats["summary"]["Model"] = model
+        stats["fault_relation"] = fault_relation
         if compare:
             stats["comparison"] = comparison_rows
 
         from eis_toolkit.workflows.reporting import write_map_pdf, write_report_docx, write_statistics_xlsx
 
         map_path = output_dir / "Map.pdf"
-        write_map_pdf(prospectivity, out_profile, deposits, str(map_path))
+        write_map_pdf(prospectivity, out_profile, deposits, str(map_path), faults=fault_overlay)
 
         xlsx_path = output_dir / "Statistics.xlsx"
         write_statistics_xlsx(stats, str(xlsx_path))
