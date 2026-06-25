@@ -4117,6 +4117,65 @@ def set_raster_nodata_cli(
     ProgressLog.finish()
 
 
+# --- Workflows -------------------------------------------------------------
+
+
+class MpmModel(str, Enum):
+    """Classifier choices for the mineral prospectivity workflow."""
+
+    random_forest = "random_forest"
+    gradient_boosting = "gradient_boosting"
+    logistic_regression = "logistic_regression"
+
+
+@app.command()
+def run_mpm_workflow_cli(
+    dem: INPUT_FILE_OPTION,
+    fault: INPUT_FILE_OPTION,
+    geology: INPUT_FILE_OPTION,
+    deposits: INPUT_FILE_OPTION,
+    output_dir: OUTPUT_DIR_OPTION,
+    extra_raster: Annotated[Optional[List[Path]], typer.Option()] = None,
+    model: Annotated[MpmModel, typer.Option(case_sensitive=False)] = MpmModel.random_forest,
+    compare: bool = False,
+    commodity_filter: Optional[str] = None,
+    fallback_crs: Optional[str] = None,
+    n_estimators: int = 100,
+    random_state: int = 42,
+):
+    """Run the one-click mineral prospectivity mapping workflow.
+
+    Takes a DEM raster and fault, geology and deposit vector layers, trains the
+    chosen classifier and writes a prospectivity map (Map.pdf), statistics
+    workbook (Statistics.xlsx) and summary report (Report.docx) to the output
+    directory. Additional evidence rasters can be supplied with repeated
+    --extra-raster options.
+    """
+    from eis_toolkit.workflows.mineral_prospectivity import run_mineral_prospectivity_workflow
+
+    with ProgressLog.running_algorithm():
+        outputs = run_mineral_prospectivity_workflow(
+            dem_file=dem,
+            fault_file=fault,
+            geology_file=geology,
+            deposit_file=deposits,
+            output_dir=output_dir,
+            extra_rasters=[str(p) for p in extra_raster] if extra_raster else None,
+            model=model.value,
+            compare=compare,
+            commodity_filter=commodity_filter,
+            fallback_crs=fallback_crs,
+            n_estimators=n_estimators,
+            random_state=random_state,
+        )
+
+    with ProgressLog.saving_output_files(output_dir):
+        for name, path in outputs.items():
+            typer.echo(f"  {name}: {path}")
+
+    ProgressLog.finish()
+
+
 # if __name__ == "__main__":
 def cli():
     """CLI app."""

@@ -17,6 +17,7 @@ keywords = [
 
 [tool.poetry.scripts]
 eis = "eis_toolkit.cli:app"
+eis-mpm-gui = "eis_toolkit.workflows.gui:main"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.11"
